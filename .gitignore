@@ -1,0 +1,20 @@
+# Build output
+bin/
+obj/
+publish/
+
+# IDE / editor state
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userprefs
+
+# Local runtime data — the widget writes these to %APPDATA%/%LOCALAPPDATA%,
+# never inside the repo, but ignore them defensively so an accidental copy
+# (auth tokens, personal usage, account details) can never be committed.
+auth.dat
+widget.log
+usage.json
+config.json
