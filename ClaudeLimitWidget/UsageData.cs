@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace ClaudeLimitWidget;
 
 /// <summary>State of one rate-limit window (5-hour, 7-day, or per-model 7-day).</summary>
@@ -16,6 +18,7 @@ public sealed record WindowUsage
     public string Source { get; init; } = "";
 
     /// <summary>Percent adjusted for a reset that has already passed.</summary>
+    [JsonIgnore]
     public double EffectivePercent =>
         ResetsAt > 0 && DateTimeOffset.UtcNow.ToUnixTimeSeconds() >= ResetsAt ? 0 : Percent;
 
@@ -71,8 +74,19 @@ public sealed record UsageSnapshot
     public SessionInfo? Session { get; init; }
     public AccountInfo? Account { get; init; }
 
+    /// <summary>Explains why there is nothing (or nothing fresh) to show; "" when fine.</summary>
+    public string Notice { get; init; } = "";
+
     /// <summary>Worst utilization across the two primary windows — drives colors and mood.</summary>
+    [JsonIgnore]
     public double WorstPercent => Math.Max(FiveHour?.EffectivePercent ?? 0, SevenDay?.EffectivePercent ?? 0);
+
+    /// <summary>
+    /// False until at least one primary window has ever been read. Distinguishes
+    /// "we don't know yet" from a genuine 0%, which look identical on a bar.
+    /// </summary>
+    [JsonIgnore]
+    public bool HasData => FiveHour is not null || SevenDay is not null;
 
     public static readonly UsageSnapshot Empty = new();
 }

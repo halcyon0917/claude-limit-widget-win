@@ -26,7 +26,7 @@ public sealed class HoverTooltip : Form
 
     private abstract record Row;
     private sealed record TitleRow(string Left, string Right) : Row;
-    private sealed record BarRow(string Label, double Percent, string Detail, bool Stale) : Row;
+    private sealed record BarRow(string Label, double Percent, string Detail, bool Stale, bool Unknown = false) : Row;
     private sealed record TextRow(string Text, bool Dim) : Row;
     private sealed record SeparatorRow : Row;
 
@@ -146,7 +146,9 @@ public sealed class HoverTooltip : Form
             rows.Add(new BarRow("Extra usage", extra.Utilization ?? 0, detail, false));
         }
 
-        if (usage.FiveHour is null && usage.SevenDay is null)
+        if (usage.Notice.Length > 0)
+            rows.Add(new TextRow(usage.Notice, Dim: false));
+        else if (!usage.HasData)
             rows.Add(new TextRow("Waiting for data — use Claude Code once to populate.", Dim: false));
 
         if (usage.Session is { } s && (s.Model.Length > 0 || s.CostUsd > 0))
@@ -183,7 +185,7 @@ public sealed class HoverTooltip : Form
         if (w is null)
         {
             if (!optional)
-                rows.Add(new BarRow(label, 0, "no data yet", false));
+                rows.Add(new BarRow(label, 0, "no data yet", Stale: false, Unknown: true));
             return;
         }
         rows.Add(new BarRow(label, w.EffectivePercent, ResetText(w), w.IsStale(staleAfter)));
@@ -255,7 +257,13 @@ public sealed class HoverTooltip : Form
                     using (var tp = RoundedRect(track, barH / 2))
                         g.FillPath(trackBrush, tp);
                     double pct = Math.Min(b.Percent, 100);
-                    if (pct > 0)
+                    if (b.Unknown)
+                    {
+                        using var dashBrush = new SolidBrush(TextDim);
+                        for (int dx = 3; dx + 4 < BarW; dx += 8)
+                            g.FillRectangle(dashBrush, barX + dx, track.Y + 2, 4, 2);
+                    }
+                    else if (pct > 0)
                     {
                         Color c = pct >= 95 ? BarRed : pct >= 80 ? BarOrange : BarBlue;
                         if (b.Stale)
@@ -267,7 +275,7 @@ public sealed class HoverTooltip : Form
                     }
 
                     // percent + detail
-                    string pctText = $"{b.Percent:0}%";
+                    string pctText = b.Unknown ? "—" : $"{b.Percent:0}%";
                     var pctSize = g.MeasureString(pctText, _rowBold);
                     g.DrawString(pctText, _rowBold, mainBrush, barX + BarW + PctW - pctSize.Width, cy - 9);
                     if (b.Detail.Length > 0)

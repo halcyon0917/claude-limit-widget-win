@@ -18,6 +18,7 @@ public sealed class WidgetRenderer : IDisposable
     private static readonly Color BarOrange = Color.FromArgb(0xE8, 0x96, 0x3C);
     private static readonly Color BarRed = Color.FromArgb(0xE0, 0x52, 0x52);
     private static readonly Color LabelColor = Color.FromArgb(0xD9, 0xD9, 0xD9);
+    private static readonly Color Unknown = Color.FromArgb(0x5A, 0x5A, 0x60);
 
     private Font? _labelFont;
     private float _labelFontHeightPx = -1;
@@ -57,6 +58,7 @@ public sealed class WidgetRenderer : IDisposable
         }
 
         double worst = usage.WorstPercent;
+        bool hasData = usage.HasData;
 
         // Layout: bars stacked on the left, mascot on the right
         int padX = (int)(9 * u);
@@ -82,7 +84,7 @@ public sealed class WidgetRenderer : IDisposable
         // Hard pixel edges for the sprite — antialiased fills leave seams between cells.
         g.PixelOffsetMode = PixelOffsetMode.None;
         g.SmoothingMode = SmoothingMode.None;
-        Mascot.SetMood(worst);
+        Mascot.SetMood(worst, hasData);
         Mascot.Draw(g, mascotRect, worst);
     }
 
@@ -94,13 +96,28 @@ public sealed class WidgetRenderer : IDisposable
         using (var trackBrush = new SolidBrush(Track))
             g.FillPath(trackBrush, trackPath);
 
+        // Unknown (never fetched) reads as dim dashes, so it cannot be mistaken
+        // for a real 0%.
+        if (win is null)
+        {
+            using (var unknownBrush = new SolidBrush(Unknown))
+            {
+                int dashW = Math.Max(2, (int)(3 * u));
+                int gapW = Math.Max(2, (int)(3 * u));
+                for (int dx = h / 2; dx + dashW < w - h / 2; dx += dashW + gapW)
+                    g.FillRectangle(unknownBrush, x + dx, (int)y + h / 2 - 1, dashW, Math.Max(1, h / 3));
+            }
+            g.DrawString(label, _labelFont!, GetLabelBrush(), x - 1 * u, y + h);
+            return;
+        }
+
         // Fill
-        double pct = win?.EffectivePercent ?? 0;
+        double pct = win.EffectivePercent;
         if (pct > 0)
         {
             int fillW = Math.Max(h, (int)(w * Math.Min(pct, 100) / 100.0));
             Color color = pct >= 95 ? BarRed : pct >= 80 ? BarOrange : BarBlue;
-            bool stale = win is not null && win.IsStale(StaleAfter);
+            bool stale = win.IsStale(StaleAfter);
             if (stale)
                 color = Color.FromArgb(150, color);
 

@@ -40,6 +40,9 @@ public sealed class UsageService : IDisposable
     private SessionInfo? _session;
     private AccountInfo? _account;
     private string _lastTokenMark = "";
+    private TokenStatus _tokenStatus = TokenStatus.Ok;
+
+    private enum TokenStatus { Ok, Missing, Expired }
 
     public event Action<UsageSnapshot>? UsageUpdated;
 
@@ -58,6 +61,7 @@ public sealed class UsageService : IDisposable
                     ExtraUsage = _extraUsage,
                     Session = _session,
                     Account = _account,
+                    Notice = BuildNotice(),
                 };
         }
     }
@@ -69,9 +73,13 @@ public sealed class UsageService : IDisposable
 
         Directory.CreateDirectory(Config.DataDir);
 
+        // Seed from the last run so a reboot shows the previous reading (marked
+        // stale) rather than an empty bar until the first poll succeeds.
+        LoadCache();
+
         if (!_standalone)
         {
-            _account = ReadLocalAccountInfo();
+            _account = ReadLocalAccountInfo() ?? _account;
             ReadUsageFile();
 
             _usageWatcher = new FileSystemWatcher(Config.DataDir, "usage.json")
@@ -217,7 +225,7 @@ public sealed class UsageService : IDisposable
                 return;
 
             // Detect a different token → different (or re-signed) account: drop stale data.
-            string mark = token.Length > 24 ? token[..24] : token;
+            string mark = Fingerprint(token);
             bool tokenChanged;
             lock (_gate)
             {
@@ -233,7 +241,7 @@ public sealed class UsageService : IDisposable
                 }
             }
             if (tokenChanged)
-                UsageUpdated?.Invoke(Current);
+                Publish();
 
             bool needProfile;
             lock (_gate)
@@ -315,7 +323,7 @@ public sealed class UsageService : IDisposable
                 _profileFetched = true;
             }
             if (changed)
-                UsageUpdated?.Invoke(Current);
+                Publish();
         }
         catch
         {
@@ -414,47 +422,163 @@ public sealed class UsageService : IDisposable
 
     private string? GetToken() => _standalone ? GetStandaloneToken() : ReadCliToken();
 
-    private static string? GetStandaloneToken()
+    private string? GetStandaloneToken()
     {
         var tokens = TokenStore.Load();
         if (tokens is null || tokens.AccessToken.Length == 0)
-            return null;
+            return Fail(TokenStatus.Missing);
 
         if (!tokens.IsExpired)
-            return tokens.AccessToken;
+            return Ok(tokens.AccessToken);
 
         if (tokens.RefreshToken.Length == 0)
-            return null; // long-lived token that finally expired → user must sign in again
+            return Fail(TokenStatus.Expired); // long-lived token expired â sign in again
 
         var rotated = OAuthClient.Refresh(tokens.RefreshToken);
         if (rotated is null)
-            return null;
+            return Fail(TokenStatus.Expired);
         TokenStore.Save(rotated);
-        return rotated.AccessToken;
+        return Ok(rotated.AccessToken);
     }
 
-    private static string? ReadCliToken()
+    private string? ReadCliToken()
     {
         try
         {
             string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
                 ".claude", ".credentials.json");
             if (!File.Exists(path))
-                return null;
+                return Fail(TokenStatus.Missing);
 
             if (JsonNode.Parse(File.ReadAllText(path)) is not JsonObject obj ||
                 obj["claudeAiOauth"] is not JsonObject oauth)
-                return null;
+                return Fail(TokenStatus.Missing);
 
             long expiresAtMs = oauth["expiresAt"]?.GetValue<long?>() ?? 0;
             if (expiresAtMs > 0 && expiresAtMs < DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + 60_000)
-                return null; // expired or about to; Claude Code will refresh it on next use
+                return Fail(TokenStatus.Expired); // Claude Code renews it on its next run
 
-            return oauth["accessToken"]?.GetValue<string>();
+            string? token = oauth["accessToken"]?.GetValue<string>();
+            return token is null ? Fail(TokenStatus.Missing) : Ok(token);
         }
         catch
         {
-            return null;
+            return Fail(TokenStatus.Missing);
+        }
+    }
+
+    private string? Fail(TokenStatus status)
+    {
+        SetTokenStatus(status);
+        return null;
+    }
+
+    private string Ok(string token)
+    {
+        SetTokenStatus(TokenStatus.Ok);
+        return token;
+    }
+
+    private void SetTokenStatus(TokenStatus status)
+    {
+        bool changed;
+        lock (_gate)
+        {
+            changed = _tokenStatus != status;
+            _tokenStatus = status;
+        }
+        if (changed)
+            Publish();
+    }
+
+    /// <summary>
+    /// Explains an empty or frozen widget. A missing/expired token is the common
+    /// case after a reboot: Claude Code renews it only when it next runs.
+    /// </summary>
+    private string BuildNotice()
+    {
+        if (_tokenStatus == TokenStatus.Ok)
+            return "";
+        bool expired = _tokenStatus == TokenStatus.Expired;
+        return _standalone
+            ? (expired
+                ? "Standalone sign-in expired — tray → Data source → Sign in."
+                : "Not signed in — tray → Data source → Sign in.")
+            : (expired
+                ? "Claude Code token expired — run claude once to renew it."
+                : "No Claude Code login found — run claude and sign in.");
+    }
+
+    /// <summary>Stable, non-reversible id for an access token (account-change detection).</summary>
+    private static string Fingerprint(string token) =>
+        Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(token)))[..16];
+
+    // ---- last-known figures, so a restart is not a blank widget ----
+
+    private void Publish()
+    {
+        var snapshot = Current;
+        SaveCache(snapshot);
+        UsageUpdated?.Invoke(snapshot);
+    }
+
+    private void SaveCache(UsageSnapshot snapshot)
+    {
+        if (!snapshot.HasData)
+            return;
+        try
+        {
+            Directory.CreateDirectory(Config.DataDir);
+            var payload = new JsonObject
+            {
+                ["tokenMark"] = _lastTokenMark,
+                ["snapshot"] = JsonNode.Parse(JsonSerializer.Serialize(snapshot)),
+            };
+            string tmp = Config.CacheFilePath + ".tmp";
+            File.WriteAllText(tmp, payload.ToJsonString());
+            File.Move(tmp, Config.CacheFilePath, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            Log.Write($"cache write failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private void LoadCache()
+    {
+        try
+        {
+            if (!File.Exists(Config.CacheFilePath))
+                return;
+            if (JsonNode.Parse(File.ReadAllText(Config.CacheFilePath)) is not JsonObject payload)
+                return;
+            var snapshot = payload["snapshot"] is JsonNode n
+                ? JsonSerializer.Deserialize<UsageSnapshot>(n.ToJsonString())
+                : null;
+            if (snapshot is null)
+                return;
+
+            lock (_gate)
+            {
+                // Restored with their original timestamps, so live data always wins
+                // the merge and an elapsed window still decays to zero on its own.
+                _fiveHour = snapshot.FiveHour;
+                _sevenDay = snapshot.SevenDay;
+                _sevenDayOpus = snapshot.SevenDayOpus;
+                _sevenDaySonnet = snapshot.SevenDaySonnet;
+                _scoped = snapshot.Scoped ?? Array.Empty<ScopedWindow>();
+                _extraUsage = snapshot.ExtraUsage;
+                _session ??= snapshot.Session;
+                _account ??= snapshot.Account;
+                // If the account changed while we were closed, the first poll sees a
+                // different fingerprint and clears all of this.
+                _lastTokenMark = payload["tokenMark"]?.GetValue<string>() ?? "";
+            }
+        }
+        catch
+        {
+            // Corrupt cache -> start empty rather than crash.
         }
     }
 
@@ -520,7 +644,7 @@ public sealed class UsageService : IDisposable
             }
         }
         if (changed)
-            UsageUpdated?.Invoke(Current);
+            Publish();
 
         static bool Newer(ref WindowUsage? slot, WindowUsage? candidate)
         {

@@ -104,10 +104,13 @@ public sealed class MascotAnimator
         _ => "waving",
     };
 
-    /// <summary>Sets the mood; restarts animation state only when it changes.</summary>
-    public void SetMood(double worstPercent)
+    /// <summary>
+    /// Sets the mood; restarts animation state only when it changes. With no data
+    /// yet, idles rather than celebrating — 0% and "unknown" are not the same thing.
+    /// </summary>
+    public void SetMood(double worstPercent, bool hasData = true)
     {
-        string name = MoodFor(worstPercent);
+        string name = hasData ? MoodFor(worstPercent) : "walking";
         if (_mood == name)
             return;
         _mood = name;
