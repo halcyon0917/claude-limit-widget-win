@@ -17,4 +17,5 @@ publish/
 auth.dat
 widget.log
 usage.json
+cache.json
 config.json

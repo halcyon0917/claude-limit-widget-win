@@ -78,10 +78,19 @@ Requires .NET 8 SDK; the exe runs on the preinstalled .NET 8 Desktop Runtime.
 ## Files
 
 - Config: `%APPDATA%\ClaudeLimitWidget\config.json`
-- Data + log: `%LOCALAPPDATA%\ClaudeLimitWidget\usage.json`, `widget.log`
+- Data + log: `%LOCALAPPDATA%\ClaudeLimitWidget\usage.json`, `cache.json`, `widget.log`
+
+`cache.json` holds the last figures so a reboot shows the previous reading (marked
+stale) instead of an empty bar. It stores no token — only a SHA-256 fingerprint of
+the access token, used to notice an account switch and discard the cache.
 
 ## Notes
 
+- **After a reboot the CLI access token is often expired** (it lives ~8 h, and Claude
+  Code renews it only when it next runs). Until then the widget cannot poll, so it
+  shows the cached figures plus a note in the tooltip; running `claude` once renews
+  the token and the widget updates within seconds. A window that has never been
+  fetched renders as dim dashes rather than a misleading 0%.
 - Must run non-elevated (Windows blocks parenting into explorer's taskbar across integrity levels).
 - If embedding ever breaks after a Windows update, right-click the tray icon and untick
   "Embed in taskbar" to use the floating fallback at the same spot.

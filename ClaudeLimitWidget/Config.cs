@@ -33,6 +33,12 @@ public sealed class Config
     /// <summary>Path of the usage snapshot written by the statusline bridge.</summary>
     public static string UsageFilePath => Path.Combine(DataDir, "usage.json");
 
+    /// <summary>
+    /// Last known figures, persisted so a restart shows the previous reading
+    /// instead of an empty bar while waiting for the first successful poll.
+    /// </summary>
+    public static string CacheFilePath => Path.Combine(DataDir, "cache.json");
+
     public static Config Load()
     {
         try
