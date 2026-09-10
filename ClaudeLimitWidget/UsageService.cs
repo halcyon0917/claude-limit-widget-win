@@ -7,11 +7,14 @@ namespace ClaudeLimitWidget;
 /// <summary>
 /// Aggregates usage data and raises <see cref="UsageUpdated"/>.
 ///
-/// Auth modes:
-///  - "cli": follows the Claude Code CLI login — token from ~/.claude/.credentials.json
+/// One instance serves ONE account; the app runs one per enabled account.
+///
+/// Account kinds:
+///  - Cli: follows the Claude Code CLI login — token from ~/.claude/.credentials.json
 ///    (re-read every poll, watched for account switches) plus the statusline bridge file.
-///  - "standalone": widget-owned token from <see cref="TokenStore"/> (DPAPI), refreshed
-///    via OAuth when expired. The statusline file is ignored — it reflects the CLI account.
+///  - OAuth: widget-owned token from <see cref="TokenStore"/> (DPAPI), refreshed when
+///    expired. The statusline file is ignored — it reflects the CLI account, not this one.
+///  - SetupToken: a pasted long-lived token; usable until it expires, never refreshed.
 ///
 /// Account identity (plan/org/email) comes from the profile endpoint for whichever token
 /// is in use; on a token/account change all cached data is cleared immediately.
@@ -25,7 +28,7 @@ public sealed class UsageService : IDisposable
 
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(10) };
 
-    private readonly bool _standalone;
+    private readonly AccountConfig _account_;
     private readonly System.Threading.Timer _pollTimer;
     private readonly FileSystemWatcher? _usageWatcher;
     private readonly FileSystemWatcher? _credsWatcher;
@@ -39,8 +42,37 @@ public sealed class UsageService : IDisposable
     private ExtraUsageInfo? _extraUsage;
     private SessionInfo? _session;
     private AccountInfo? _account;
-    private string _lastTokenMark = "";
+
+    /// <summary>
+    /// Email of the account the cached figures were fetched for. Kept apart from
+    /// <see cref="_account"/> (which is display identity and may be refreshed from
+    /// local config) so a slot that changed hands is detected instead of showing
+    /// one account's numbers under another's name.
+    /// </summary>
+    private string _dataOwnerEmail = "";
     private TokenStatus _tokenStatus = TokenStatus.Ok;
+
+    /// <summary>
+    /// Set when the API rejects this credential outright (e.g. a token without the
+    /// user:profile scope). Explains a permanently empty widget.
+    /// </summary>
+    private string _apiNotice = "";
+
+    /// <summary>
+    /// Set when the credential is refused for a reason retrying cannot fix (a missing
+    /// scope). Polling stops entirely: it can never succeed, and the failed requests
+    /// get the token rate limited, which also blocks signing in again to repair it.
+    /// Cleared by re-authenticating, which builds a fresh service.
+    /// </summary>
+    private bool _scopeBlocked;
+
+    /// <summary>
+    /// Fingerprint of the token the identity was last fetched for. A different token
+    /// means the profile must be re-checked — the credential may now belong to someone
+    /// else. It is only a trigger to re-ask, never grounds to discard data: tokens
+    /// rotate constantly for one unchanged account.
+    /// </summary>
+    private string _profileTokenMark = "";
 
     private enum TokenStatus { Ok, Missing, Expired }
 
@@ -66,9 +98,16 @@ public sealed class UsageService : IDisposable
         }
     }
 
-    public UsageService(Config config)
+    /// <summary>The account this poller serves.</summary>
+    public AccountConfig Account => _account_;
+
+    /// <param name="stagger">
+    /// Index among the running pollers; spreads first polls a few seconds apart so
+    /// several accounts do not all hit the endpoint at the same instant.
+    /// </param>
+    public UsageService(AccountConfig account, Config config, int stagger = 0)
     {
-        _standalone = config.AuthMode == "standalone";
+        _account_ = account;
         int pollSeconds = Math.Max(60, config.ApiPollSeconds);
 
         Directory.CreateDirectory(Config.DataDir);
@@ -77,9 +116,11 @@ public sealed class UsageService : IDisposable
         // stale) rather than an empty bar until the first poll succeeds.
         LoadCache();
 
-        if (!_standalone)
+        if (_account_.UsesStatusline)
         {
-            _account = ReadLocalAccountInfo() ?? _account;
+            var local = ReadLocalAccountInfo();
+            DiscardIfDifferentOwner(local?.Email ?? "");
+            _account = local ?? _account;
             ReadUsageFile();
 
             _usageWatcher = new FileSystemWatcher(Config.DataDir, "usage.json")
@@ -110,7 +151,7 @@ public sealed class UsageService : IDisposable
         }
 
         _pollTimer = new System.Threading.Timer(_ => PollApi(), null,
-            TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(pollSeconds));
+            TimeSpan.FromSeconds(2 + stagger * 3), TimeSpan.FromSeconds(pollSeconds));
     }
 
     /// <summary>Force an immediate re-read + API poll (tray "Refresh now").</summary>
@@ -118,7 +159,7 @@ public sealed class UsageService : IDisposable
     {
         ThreadPool.QueueUserWorkItem(_ =>
         {
-            if (!_standalone)
+            if (_account_.UsesStatusline)
             {
                 lock (_gate)
                     _account = ReadLocalAccountInfo() ?? _account;
@@ -216,36 +257,42 @@ public sealed class UsageService : IDisposable
 
     private bool _profileFetched;
 
+    private DateTimeOffset _backoffUntil = DateTimeOffset.MinValue;
+    private int _backoffSeconds;
+
     private void PollApi()
     {
         try
         {
-            string? token = GetToken();
-            if (token is null)
-                return;
-
-            // Detect a different token → different (or re-signed) account: drop stale data.
-            string mark = Fingerprint(token);
-            bool tokenChanged;
             lock (_gate)
             {
-                tokenChanged = _lastTokenMark.Length > 0 && _lastTokenMark != mark;
-                _lastTokenMark = mark;
-                if (tokenChanged)
-                {
-                    Log.Write("token changed → clearing cached usage data");
-                    _fiveHour = _sevenDay = _sevenDayOpus = _sevenDaySonnet = null;
-                    _extraUsage = null;
-                    _session = null;
-                    _profileFetched = false;
-                }
+                if (_scopeBlocked)
+                    return; // hopeless until re-authenticated; do not add to the noise
+                if (DateTimeOffset.UtcNow < _backoffUntil)
+                    return; // rate limited; wait it out rather than making it worse
             }
-            if (tokenChanged)
-                Publish();
 
+            string? token = GetToken();
+            if (token is null)
+            {
+                Log.Write($"[{_account_.Id}] no usable token ({_tokenStatus})");
+                return;
+            }
+
+            // A changed token may be a changed person, so re-ask who this is. Without
+            // this the first answer sticks forever and a CLI /login as someone else
+            // shows the new figures under the previous name.
+            string mark = Fingerprint(token);
             bool needProfile;
             lock (_gate)
+            {
+                if (_profileTokenMark != mark)
+                {
+                    _profileTokenMark = mark;
+                    _profileFetched = false;
+                }
                 needProfile = !_profileFetched || _account is null;
+            }
             if (needProfile)
                 FetchProfile(token);
 
@@ -255,14 +302,58 @@ public sealed class UsageService : IDisposable
             req.Headers.TryAddWithoutValidation("User-Agent", UserAgent);
 
             using var resp = Http.Send(req);
+            if ((int)resp.StatusCode == 429)
+            {
+                // Backing off matters: the limit is per token, so continuing to poll
+                // every few minutes keeps it tripped and also blocks sign-ins.
+                // The endpoint states how long to wait; trust it over guesswork and
+                // only fall back to doubling when the header is absent.
+                int wait = resp.Headers.RetryAfter?.Delta is { } delta
+                    ? (int)delta.TotalSeconds
+                    : resp.Headers.RetryAfter?.Date is { } date
+                        ? (int)(date - DateTimeOffset.UtcNow).TotalSeconds
+                        : 0;
+                lock (_gate)
+                {
+                    _backoffSeconds = wait > 0
+                        ? Math.Clamp(wait, 60, 3600)
+                        : (_backoffSeconds == 0 ? 300 : Math.Min(_backoffSeconds * 2, 1800));
+                    _backoffUntil = DateTimeOffset.UtcNow.AddSeconds(_backoffSeconds);
+                }
+                Log.Write($"usage poll rate limited; backing off {_backoffSeconds}s");
+                return;
+            }
             if (!resp.IsSuccessStatusCode)
+            {
+                string why = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                Log.Write($"[{_account_.Id}] usage poll failed HTTP {(int)resp.StatusCode}: {Trim(why)}");
+                if ((int)resp.StatusCode == 403 && why.Contains("scope requirement"))
+                {
+                    lock (_gate)
+                        _scopeBlocked = true;
+                    Log.Write($"[{_account_.Id}] scope refused; polling stopped until re-authenticated");
+                    SetApiNotice("This token lacks the user:profile scope — tray → Accounts → sign in again.");
+                }
+                else
+                {
+                    SetApiNotice("");
+                }
                 return; // 401 → token rotated; next poll re-reads/refreshes
+            }
+            SetApiNotice("");
+
+            lock (_gate)
+            {
+                _backoffSeconds = 0;
+                _backoffUntil = DateTimeOffset.MinValue;
+            }
 
             string body = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
             if (JsonNode.Parse(body) is not JsonObject obj)
                 return;
 
             long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            Log.Write($"[{_account_.Id}] usage poll ok; five_hour={(obj["five_hour"] is JsonObject fh ? fh["utilization"]?.ToString() ?? "null" : "absent")}");
             var scoped = ParseScopedLimits(obj["limits"], now);
             lock (_gate)
             {
@@ -294,7 +385,18 @@ public sealed class UsageService : IDisposable
 
             using var resp = Http.Send(req);
             if (!resp.IsSuccessStatusCode)
+            {
+                string why = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                Log.Write($"[{_account_.Id}] profile fetch failed HTTP {(int)resp.StatusCode}: {Trim(why)}");
+                if ((int)resp.StatusCode == 403 && why.Contains("scope requirement"))
+                {
+                    lock (_gate)
+                        _scopeBlocked = true;
+                    Log.Write($"[{_account_.Id}] scope refused; polling stopped until re-authenticated");
+                    SetApiNotice("This token lacks the user:profile scope — tray → Accounts → sign in again.");
+                }
                 return;
+            }
 
             string body = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
             if (JsonNode.Parse(body) is not JsonObject obj)
@@ -318,6 +420,14 @@ public sealed class UsageService : IDisposable
             bool changed;
             lock (_gate)
             {
+                // A different person behind the same slot (CLI /login elsewhere, or a
+                // re-auth to another account) invalidates every cached figure. Identity
+                // is the right key here: access tokens rotate every few hours for the
+                // very same account, so comparing tokens would discard good data.
+                DiscardIfDifferentOwner(info.Email);
+                if (info.Email.Length > 0)
+                    _dataOwnerEmail = info.Email;
+
                 changed = !info.Equals(_account);
                 _account = info;
                 _profileFetched = true;
@@ -329,6 +439,44 @@ public sealed class UsageService : IDisposable
         {
             // Identity is cosmetic; usage polling continues without it.
         }
+    }
+
+    /// <summary>
+    /// Drops cached figures when they demonstrably belong to a different account.
+    /// Unknown identity on either side is not evidence of a change, so it keeps them.
+    /// Caller holds <see cref="_gate"/> (or is still constructing).
+    /// </summary>
+    private void DiscardIfDifferentOwner(string currentEmail)
+    {
+        if (currentEmail.Length == 0 || _dataOwnerEmail.Length == 0)
+        {
+            if (_dataOwnerEmail.Length == 0)
+                _dataOwnerEmail = currentEmail;
+            return;
+        }
+        if (string.Equals(_dataOwnerEmail, currentEmail, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        Log.Write($"slot changed hands ({_dataOwnerEmail} -> {currentEmail}); clearing cached usage");
+        _fiveHour = _sevenDay = _sevenDayOpus = _sevenDaySonnet = null;
+        _scoped = Array.Empty<ScopedWindow>();
+        _extraUsage = null;
+        _session = null;
+        _account = null;
+        _dataOwnerEmail = currentEmail;
+    }
+
+    /// <summary>Stable, non-reversible id for a token, to notice it was replaced.</summary>
+    private static string Fingerprint(string token) =>
+        Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(token)))[..16];
+
+    /// <summary>Short, single-line form of an error body for the log.</summary>
+    private static string Trim(string body)
+    {
+        // ReplaceLineEndings keeps this free of escape sequences.
+        string flat = body.ReplaceLineEndings(" ").Trim();
+        return flat.Length > 160 ? flat[..160] : flat;
     }
 
     private static string PrettyPlan(string orgType) => orgType switch
@@ -420,11 +568,19 @@ public sealed class UsageService : IDisposable
 
     // ---- token acquisition ----
 
-    private string? GetToken() => _standalone ? GetStandaloneToken() : ReadCliToken();
-
-    private string? GetStandaloneToken()
+    private string? GetToken() => _account_.Kind switch
     {
-        var tokens = TokenStore.Load();
+        AccountKind.Cli => ReadCliToken(),
+        _ => GetStoredToken(),
+    };
+
+    /// <summary>
+    /// Token for an OAuth or setup-token account. Only OAuth accounts can refresh:
+    /// a setup token has no refresh half, so when it lapses the user must re-add it.
+    /// </summary>
+    private string? GetStoredToken()
+    {
+        var tokens = TokenStore.Load(_account_.Id);
         if (tokens is null || tokens.AccessToken.Length == 0)
             return Fail(TokenStatus.Missing);
 
@@ -432,12 +588,12 @@ public sealed class UsageService : IDisposable
             return Ok(tokens.AccessToken);
 
         if (tokens.RefreshToken.Length == 0)
-            return Fail(TokenStatus.Expired); // long-lived token expired â sign in again
+            return Fail(TokenStatus.Expired); // long-lived token expired → re-add it
 
         var rotated = OAuthClient.Refresh(tokens.RefreshToken);
         if (rotated is null)
             return Fail(TokenStatus.Expired);
-        TokenStore.Save(rotated);
+        TokenStore.Save(_account_.Id, rotated);
         return Ok(rotated.AccessToken);
     }
 
@@ -495,24 +651,38 @@ public sealed class UsageService : IDisposable
     /// Explains an empty or frozen widget. A missing/expired token is the common
     /// case after a reboot: Claude Code renews it only when it next runs.
     /// </summary>
+    private void SetApiNotice(string notice)
+    {
+        bool changed;
+        lock (_gate)
+        {
+            changed = _apiNotice != notice;
+            _apiNotice = notice;
+        }
+        if (changed)
+            Publish();
+    }
+
     private string BuildNotice()
     {
+        if (_apiNotice.Length > 0)
+            return _apiNotice;
         if (_tokenStatus == TokenStatus.Ok)
             return "";
         bool expired = _tokenStatus == TokenStatus.Expired;
-        return _standalone
-            ? (expired
-                ? "Standalone sign-in expired — tray → Data source → Sign in."
-                : "Not signed in — tray → Data source → Sign in.")
-            : (expired
+        return _account_.Kind switch
+        {
+            AccountKind.Cli => expired
                 ? "Claude Code token expired — run claude once to renew it."
-                : "No Claude Code login found — run claude and sign in.");
+                : "No Claude Code login found — run claude and sign in.",
+            AccountKind.SetupToken => expired
+                ? "Setup token expired — tray → Accounts → re-add this account."
+                : "No token stored — tray → Accounts → re-add this account.",
+            _ => expired
+                ? "Sign-in expired — tray → Accounts → sign in again."
+                : "Not signed in — tray → Accounts → sign in.",
+        };
     }
-
-    /// <summary>Stable, non-reversible id for an access token (account-change detection).</summary>
-    private static string Fingerprint(string token) =>
-        Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
-            System.Text.Encoding.UTF8.GetBytes(token)))[..16];
 
     // ---- last-known figures, so a restart is not a blank widget ----
 
@@ -532,12 +702,12 @@ public sealed class UsageService : IDisposable
             Directory.CreateDirectory(Config.DataDir);
             var payload = new JsonObject
             {
-                ["tokenMark"] = _lastTokenMark,
                 ["snapshot"] = JsonNode.Parse(JsonSerializer.Serialize(snapshot)),
             };
-            string tmp = Config.CacheFilePath + ".tmp";
+            string cachePath = Config.CacheFilePath(_account_.Id);
+            string tmp = cachePath + ".tmp";
             File.WriteAllText(tmp, payload.ToJsonString());
-            File.Move(tmp, Config.CacheFilePath, overwrite: true);
+            File.Move(tmp, cachePath, overwrite: true);
         }
         catch (Exception ex)
         {
@@ -549,9 +719,10 @@ public sealed class UsageService : IDisposable
     {
         try
         {
-            if (!File.Exists(Config.CacheFilePath))
+            string cachePath = Config.CacheFilePath(_account_.Id);
+            if (!File.Exists(cachePath))
                 return;
-            if (JsonNode.Parse(File.ReadAllText(Config.CacheFilePath)) is not JsonObject payload)
+            if (JsonNode.Parse(File.ReadAllText(cachePath)) is not JsonObject payload)
                 return;
             var snapshot = payload["snapshot"] is JsonNode n
                 ? JsonSerializer.Deserialize<UsageSnapshot>(n.ToJsonString())
@@ -570,10 +741,10 @@ public sealed class UsageService : IDisposable
                 _scoped = snapshot.Scoped ?? Array.Empty<ScopedWindow>();
                 _extraUsage = snapshot.ExtraUsage;
                 _session ??= snapshot.Session;
+                // Restoring the identity too is what lets the next profile fetch notice
+                // that a different account now owns this slot and drop these figures.
                 _account ??= snapshot.Account;
-                // If the account changed while we were closed, the first poll sees a
-                // different fingerprint and clears all of this.
-                _lastTokenMark = payload["tokenMark"]?.GetValue<string>() ?? "";
+                _dataOwnerEmail = snapshot.Account?.Email ?? "";
             }
         }
         catch
