@@ -24,6 +24,7 @@ public sealed class TaskbarWindow : Form
     private bool _forceFloat;
     private Rectangle _lastTarget;
     private int _reembedAttempts;
+    private int _slot;
 
     public bool IsEmbedded => _embedded;
 
@@ -91,6 +92,34 @@ public sealed class TaskbarWindow : Form
     }
 
     public void SetStaleAfter(TimeSpan t) => _renderer.StaleAfter = t;
+
+    /// <summary>
+    /// Position among the widgets, 0 = nearest the tray. Widgets stack leftwards,
+    /// so slot n sits n widget-widths further from the clock.
+    /// </summary>
+    public int Slot
+    {
+        get => _slot;
+        set
+        {
+            if (_slot == value)
+                return;
+            _slot = value;
+            _lastTarget = Rectangle.Empty; // force a reposition on the next tick
+            if (IsHandleCreated)
+                EnsurePlacement();
+        }
+    }
+
+    /// <summary>Account name shown on the widget; empty uses the single-account layout.</summary>
+    public void SetAccountLabel(string label)
+    {
+        if (_renderer.AccountLabel == label)
+            return;
+        _renderer.AccountLabel = label;
+        if (IsHandleCreated)
+            Invalidate();
+    }
 
     public void SetTransparent(bool transparent)
     {
@@ -214,15 +243,17 @@ public sealed class TaskbarWindow : Form
 
         int height = tbRect.Height;
         int width = WidgetRenderer.WidthFor(height);
+        // Slot 0 sits just left of the tray; each further slot is one widget to its left.
+        int offset = 4 + _slot * (width + 4);
 
         if (_embedded)
         {
             // Child coordinates are relative to the taskbar's client area.
             var target = new RECT
             {
-                Left = trayRect.Left - width - 4,
+                Left = trayRect.Left - width - offset,
                 Top = tbRect.Top,
-                Right = trayRect.Left - 4,
+                Right = trayRect.Left - offset,
                 Bottom = tbRect.Top + height,
             };
             MapWindowPoints(IntPtr.Zero, taskbar, ref target);
@@ -239,7 +270,7 @@ public sealed class TaskbarWindow : Form
         }
         else
         {
-            var rect = new Rectangle(trayRect.Left - width - 4, tbRect.Top, width, height);
+            var rect = new Rectangle(trayRect.Left - width - offset, tbRect.Top, width, height);
             if (rect != _lastTarget)
             {
                 TopMost = true;

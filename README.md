@@ -13,6 +13,7 @@ Hovering shows every limit window, reset countdowns, and the last session:
 ## Features
 
 - Lives **inside** the taskbar, left of the tray (TrafficMonitor-style `SetParent` embed)
+- One widget per tracked account (see Accounts below)
 - Two bars: 5-hour + weekly utilization, blue → orange (≥80%) → red (≥95%)
 - Animated Clawd mascot with 4 moods driven by your worst limit
   (from [ayotomcs.me/claude-mascot](https://ayotomcs.me/claude-mascot) SVGs):
@@ -28,28 +29,48 @@ Hovering shows every limit window, reset countdowns, and the last session:
 - **Transparent background** (tray toggle): drops the dark pill so the bars and mascot
   sit directly on the taskbar surface, as if natively part of it
 - Survives `explorer.exe` restarts (auto re-embeds within ~3 s)
-- Tray icon menu: refresh, data source, embed/float toggle, transparent background,
-  autostart toggle, exit
+- Tray icon menu: accounts (add / rename / hide / remove), refresh, embed/float toggle,
+  transparent background, autostart toggle, exit
 - Auto-start with Windows (HKCU Run key)
 
 Mascot pipeline: `tools/convert_mascots.py` parses the animation SVGs
 (frame groups + transforms) into `ClaudeLimitWidget/sprites.json` (embedded resource),
 played by `MascotAnimator.cs`. Re-run it if you swap in new SVGs.
 
-## Data source modes (tray → Data source)
+## Accounts (tray → Accounts)
 
-- **Claude Code CLI login** (default): follows whoever is logged into the CLI. The
-  credentials file is watched, so switching accounts with `/login` flips the widget
-  within seconds (cached data is cleared automatically). Statusline feed active.
-- **Standalone account**: the widget holds its own token, independent of the CLI —
-  works even without Claude Code installed. Sign in via *Sign in / change account…*
-  (opens the Claude OAuth page in your browser; paste the code back), or paste a
-  long-lived `sk-ant-…` token from `claude setup-token`. Tokens are stored
-  DPAPI-encrypted at `%APPDATA%\ClaudeLimitWidget\auth.dat` and auto-refreshed.
-  The statusline file is ignored in this mode (it reflects the CLI account).
+Track as many accounts as you like — **each enabled account gets its own widget**,
+stacked leftwards from the tray, with its own poller, its own cache and its own
+tooltip.
 
-The tooltip header and tray menu always show which account (email · plan · org) the
-widget is following, fetched from the token's own profile.
+![two accounts](docs/multi-account.png)
+
+Three kinds of account can be mixed freely:
+
+- **Claude Code CLI login** — follows whoever is logged into the CLI. The credentials
+  file is watched, so `/login` as someone else flips that widget within seconds. This
+  is the only kind that receives the statusline feed.
+- **Browser sign-in** (recommended for extra accounts) — the widget holds its own OAuth
+  token, independent of the CLI, and refreshes it automatically. Works even without
+  Claude Code installed.
+- **Pasted token** — the box also accepts a raw `sk-ant-…` token, but note that tokens
+  from **`claude setup-token` do not work here**: they are inference-only and the usage
+  endpoint requires the `user:profile` scope, so such a token returns 403 forever. The
+  widget checks this when you add an account and refuses it with an explanation rather
+  than adding a widget that never fills in. Use the browser sign-in, which requests the
+  right scope.
+
+Tokens live DPAPI-encrypted, one file per account, at
+`%APPDATA%\ClaudeLimitWidget\auth-<id>.dat`.
+
+Per account you can rename it (the name is what appears on its widget), hide its
+widget without forgetting the account, re-authenticate, or remove it. With a single
+account the widget keeps the original label layout; from two upwards each shows its
+name with short `5h` / `wk` tags so the pills are told apart at a glance. Each widget
+is ~208px wide, so budget taskbar space accordingly.
+
+The tooltip header and tray menu always show which account (email · plan · org) a
+widget is following, fetched from that token's own profile.
 
 ## How it gets data
 
@@ -78,11 +99,14 @@ Requires .NET 8 SDK; the exe runs on the preinstalled .NET 8 Desktop Runtime.
 ## Files
 
 - Config: `%APPDATA%\ClaudeLimitWidget\config.json`
-- Data + log: `%LOCALAPPDATA%\ClaudeLimitWidget\usage.json`, `cache.json`, `widget.log`
+- Data + log: `%LOCALAPPDATA%\ClaudeLimitWidget\usage.json`, `cache-<account>.json`,
+  `widget.log`
 
-`cache.json` holds the last figures so a reboot shows the previous reading (marked
-stale) instead of an empty bar. It stores no token — only a SHA-256 fingerprint of
-the access token, used to notice an account switch and discard the cache.
+Each `cache-<account>.json` holds that account's last figures so a reboot shows the
+previous reading (marked stale) instead of an empty bar. It stores no token. Cached
+figures are tied to the account they were fetched for, so if a slot changes hands —
+you `/login` as someone else, or re-authenticate a widget to another account — they
+are discarded rather than shown under the new name.
 
 ## Notes
 
@@ -96,11 +120,17 @@ the access token, used to notice an account switch and discard the cache.
   "Embed in taskbar" to use the floating fallback at the same spot.
 - The OAuth usage endpoint is undocumented and may change; the statusline source is the
   officially documented path.
+- Both `oauth/usage` and `oauth/profile` require the **`user:profile`** scope. A
+  credential without it (notably `claude setup-token` output) gets HTTP 403 on every
+  poll; the tooltip says so rather than showing an unexplained empty bar.
+- Rate limits are per token. If polling returns HTTP 429 the widget honours the
+  `Retry-After` header and stops polling until it expires, instead of re-tripping the
+  limit every few minutes.
 
 ## Security & privacy
 
-- **Your tokens stay on your machine.** In standalone mode the OAuth token pair is stored
-  DPAPI-encrypted (`CurrentUser` scope) at `%APPDATA%\ClaudeLimitWidget\auth.dat` — it can't
+- **Your tokens stay on your machine.** Each signed-in account's token pair is stored
+  DPAPI-encrypted (`CurrentUser` scope) at `%APPDATA%\ClaudeLimitWidget\auth-<id>.dat` — it can't
   be read by another user or on another machine. In CLI mode the widget only *reads* the
   token Claude Code already stores; it never copies or relocates it.
 - **Tokens are only ever sent to `api.anthropic.com` over HTTPS** (the usage/profile endpoints).
