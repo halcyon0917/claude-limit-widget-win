@@ -169,8 +169,14 @@ public sealed class TaskbarWindow : Form
             return;
         }
 
-        if (!_embedded && !_forceFloat && _reembedAttempts < 15)
+        // Burst of attempts at start, then keep trying every 30 s for as long as we
+        // float: a refusal is often transient (explorer still settling after logon,
+        // a shell restart in progress), and giving up permanently turned a passing
+        // hiccup into a widget stuck in fallback mode until the next launch.
+        if (!_embedded && !_forceFloat && (_reembedAttempts < 15 || _reembedAttempts % 30 == 0))
             TryEmbed();
+        else if (!_embedded && !_forceFloat)
+            _reembedAttempts++;
 
         Reposition();
     }
@@ -203,8 +209,11 @@ public sealed class TaskbarWindow : Form
 
         if (SetParent(Handle, taskbar) == IntPtr.Zero)
         {
-            Log.Write($"TryEmbed #{_reembedAttempts}: SetParent failed");
-            return; // blocked (AV, integrity) → float fallback keeps working
+            // 5 = access denied (UIPI: we run at a lower integrity than explorer);
+            // other codes point elsewhere, so record it rather than guess.
+            int err = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+            Log.Write($"TryEmbed #{_reembedAttempts}: SetParent failed (Win32 error {err})");
+            return; // float fallback keeps working meanwhile
         }
 
         Log.Write($"TryEmbed #{_reembedAttempts}: embedded into {taskbar:X}");
@@ -270,13 +279,18 @@ public sealed class TaskbarWindow : Form
         }
         else
         {
-            var rect = new Rectangle(trayRect.Left - width - offset, tbRect.Top, width, height);
+            // Float just ABOVE the taskbar, not over it. The shell re-asserts the
+            // taskbar's z-order constantly, so a topmost window placed on the same
+            // rect ends up behind it and the "fallback" is invisible — which is
+            // exactly what happened when embedding was refused.
+            var rect = new Rectangle(trayRect.Left - width - offset, tbRect.Top - height, width, height);
             if (rect != _lastTarget)
             {
                 TopMost = true;
                 Bounds = rect;
                 _lastTarget = rect;
                 Invalidate();
+                Log.Write($"Reposition floating: {rect}");
             }
         }
     }

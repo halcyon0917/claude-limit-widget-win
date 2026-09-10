@@ -1,10 +1,13 @@
 namespace ClaudeLimitWidget;
 
-/// <summary>Tiny diagnostic logger: %LOCALAPPDATA%\ClaudeLimitWidget\widget.log.</summary>
+/// <summary>Tiny diagnostic logger: %USERPROFILE%\.claude-limit-widget\widget.log.</summary>
 public static class Log
 {
     private static readonly object Gate = new();
-    private static readonly string PathName = System.IO.Path.Combine(Config.DataDir, "widget.log");
+
+    // Resolved per call rather than cached in a static: a path captured at type
+    // initialisation would outlive any later change in how the root resolves.
+    private static string PathName => Path.Combine(Config.DataDir, "widget.log");
 
     public static void Write(string message)
     {

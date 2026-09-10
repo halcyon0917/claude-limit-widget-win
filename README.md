@@ -61,7 +61,7 @@ Three kinds of account can be mixed freely:
   right scope.
 
 Tokens live DPAPI-encrypted, one file per account, at
-`%APPDATA%\ClaudeLimitWidget\auth-<id>.dat`.
+`%USERPROFILE%\.claude-limit-widget\auth-<id>.dat`.
 
 Per account you can rename it (the name is what appears on its widget), hide its
 widget without forgetting the account, re-authenticate, or remove it. With a single
@@ -98,9 +98,21 @@ Requires .NET 8 SDK; the exe runs on the preinstalled .NET 8 Desktop Runtime.
 
 ## Files
 
-- Config: `%APPDATA%\ClaudeLimitWidget\config.json`
-- Data + log: `%LOCALAPPDATA%\ClaudeLimitWidget\usage.json`, `cache-<account>.json`,
-  `widget.log`
+Everything lives in one folder, `%USERPROFILE%\.claude-limit-widget\`:
+
+- `config.json` — accounts and display settings
+- `auth-<account>.dat` — DPAPI-encrypted tokens, one per signed-in account
+- `cache-<account>.json` — last known figures per account
+- `usage.json` — hand-off file written by the statusline bridge
+- `widget.log` — diagnostics
+
+**Why not AppData?** Windows virtualizes AppData per MSIX package. Claude Desktop is an
+MSIX app, so anything it spawns — the statusline bridge, or a widget started from its
+integrated terminal — inherits its package identity and gets a *private* copy of AppData
+under `Packages\Claude_*\LocalCache`. A normally launched widget never sees that copy:
+the two silently diverge, and the bridge can never feed the widget. A dot-folder in the
+profile root is not virtualized, so every context shares one state. An older install's
+files are copied across from either AppData location on first run.
 
 Each `cache-<account>.json` holds that account's last figures so a reboot shows the
 previous reading (marked stale) instead of an empty bar. It stores no token. Cached
@@ -130,13 +142,14 @@ are discarded rather than shown under the new name.
 ## Security & privacy
 
 - **Your tokens stay on your machine.** Each signed-in account's token pair is stored
-  DPAPI-encrypted (`CurrentUser` scope) at `%APPDATA%\ClaudeLimitWidget\auth-<id>.dat` — it can't
+  DPAPI-encrypted (`CurrentUser` scope) at `%USERPROFILE%\.claude-limit-widget\auth-<id>.dat` — it can't
   be read by another user or on another machine. In CLI mode the widget only *reads* the
   token Claude Code already stores; it never copies or relocates it.
 - **Tokens are only ever sent to `api.anthropic.com` over HTTPS** (the usage/profile endpoints).
   They are never logged, never written in plaintext, and never sent anywhere else.
 - **Nothing personal is committed to this repo** — account details, usage numbers, and tokens
-  all live under `%APPDATA%`/`%LOCALAPPDATA%` and are covered by `.gitignore`.
+  all live under `%USERPROFILE%\.claude-limit-widget\`, outside the repository, and the
+  file names are covered by `.gitignore` defensively.
 - **Unofficial endpoints.** `api.anthropic.com/api/oauth/{usage,profile}` and the token-refresh
   endpoint are undocumented and used with Claude Code's public OAuth client ID, the same way
   community tools do. They may change or stop working without notice, and this usage is a gray
